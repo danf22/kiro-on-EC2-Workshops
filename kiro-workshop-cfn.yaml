@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template to deploy multiple EC2 instances with Kiro IDE pre-installed.
+  Each instance runs Amazon Linux 2023 with a GNOME desktop and Amazon DCV for browser-based
+  remote access. Designed for workshops where participants connect to individual instances
+  via a web browser to use the Kiro IDE UI.
+
+Parameters:
+  NumberOfInstances:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 50
+    Description: Number of EC2 instances to deploy for the workshop.
+
+  InstanceType:
+    Type: String
+    Default: t3.xlarge
+    AllowedValues:
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+      - m5.xlarge
+      - m5.2xlarge
+      - m6i.xlarge
+      - m6i.2xlarge
+    Description: EC2 instance type. Minimum t3.large (2 vCPU, 8 GiB) recommended for desktop + Kiro.
+
+  VolumeSize:
+    Type: Number
+    Default: 50
+    MinValue: 30
+    MaxValue: 200
+    Description: EBS volume size in GB for each instance.
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: (Optional) Name of an existing EC2 key pair for SSH access. Leave empty to skip.
+
+  AllowedCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR block allowed to access DCV (port 8443) and SSH (port 22).
+      Restrict to your corporate IP range for better security (e.g. 203.0.113.0/24).
+
+  DCVPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 64
+    Description: Password for the DCV user (kirouser) to log into the remote desktop.
+
+  LatestAL2023AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM parameter path for the latest Amazon Linux 2023 AMI (auto-resolved).
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Workshop Configuration
+        Parameters:
+          - NumberOfInstances
+          - InstanceType
+          - VolumeSize
+      - Label:
+          default: Access Configuration
+        Parameters:
+          - KeyPairName
+          - AllowedCIDR
+          - DCVPassword
+      - Label:
+          default: Advanced (do not change)
+        Parameters:
+          - LatestAL2023AMI
+    ParameterLabels:
+      NumberOfInstances:
+        default: "Number of workshop instances"
+      InstanceType:
+        default: "Instance type"
+      VolumeSize:
+        default: "Disk size (GB)"
+      KeyPairName:
+        default: "SSH Key Pair"
+      AllowedCIDR:
+        default: "Allowed IP range"
+      DCVPassword:
+        default: "Desktop login password"
+
+Resources:
+  # ============================================================
+  # NETWORKING
+  # ============================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-public-subnet"
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-rt"
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # ============================================================
+  # SECURITY
+  # ============================================================
+  WorkshopSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow DCV (8443), SSH (22) access for Kiro workshop instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref AllowedCIDR
+          Description: Amazon DCV web client (HTTPS)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCIDR
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # ============================================================
+  # IAM ROLE (for SSM access and DCV license)
+  # ============================================================
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-instance-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DCVLicenseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - arn:aws:s3:::dcv-license.us-east-1/*
+                  - arn:aws:s3:::dcv-license.us-west-2/*
+                  - arn:aws:s3:::dcv-license.eu-west-1/*
+                  - arn:aws:s3:::dcv-license.ap-northeast-1/*
+                  - arn:aws:s3:::dcv-license.ap-southeast-1/*
+                  - arn:aws:s3:::dcv-license.*/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ============================================================
+  # LAUNCH TEMPLATE
+  # ============================================================
+  KiroLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-kiro-lt"
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        ImageId: !Ref LatestAL2023AMI
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 2
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            SubnetId: !Ref PublicSubnet
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref WorkshopSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Project
+                Value: KiroWorkshop
+              - Key: Name
+                Value: !Sub "${AWS::StackName}-instance"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            exec > /var/log/kiro-setup.log 2>&1
+
+            echo "=== Starting Kiro Workshop Instance Setup ==="
+
+            # Update system
+            dnf update -y
+
+            # ----------------------------------------------------------
+            # 1. Install GNOME Desktop Environment
+            # ----------------------------------------------------------
+            dnf groupinstall "Desktop" -y
+            dnf install -y gdm gnome-terminal firefox
+
+            # Set graphical target as default
+            systemctl set-default graphical.target
+            systemctl enable gdm
+
+            # ----------------------------------------------------------
+            # 2. Install Amazon DCV
+            # ----------------------------------------------------------
+            # Import DCV GPG key
+            rpm --import https://d1uj6qtbmh3dt5.cloudfront.net/NICE-GPG-KEY
+
+            # Install DCV server
+            dnf install -y \
+              https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-el9-x86_64.tgz 2>/dev/null || true
+
+            # Download and extract DCV packages
+            cd /tmp
+            wget -q https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-el9-x86_64.tgz
+            tar -xzf nice-dcv-el9-x86_64.tgz
+            cd nice-dcv-*-el9-x86_64
+
+            # Install DCV packages
+            dnf install -y \
+              nice-dcv-server-*.rpm \
+              nice-dcv-web-viewer-*.rpm \
+              nice-xdcv-*.rpm \
+              nice-dcv-gltest-*.rpm 2>/dev/null || true
+
+            # ----------------------------------------------------------
+            # 3. Configure DCV
+            # ----------------------------------------------------------
+            # Enable and start DCV
+            systemctl enable dcvserver
+
+            # Configure DCV for automatic console sessions
+            mkdir -p /etc/dcv
+            cat > /etc/dcv/dcv.conf << 'DCVCONF'
+            [license]
+            [log]
+            [session-management]
+            virtual-session-xdcv-args=""
+            [session-management/defaults]
+            [session-management/automatic-console-session]
+            owner="kirouser"
+            [display]
+            [display/linux]
+            [connectivity]
+            web-port=8443
+            web-url-path="/dcv"
+            enable-quic-frontend=true
+            [security]
+            authentication="system"
+            auth-token-verifier=""
+            no-tls-strict=true
+            os-auto-lock=false
+            [clipboard]
+            primary-selection-paste=true
+            primary-selection-copy=true
+            DCVCONF
+
+            # ----------------------------------------------------------
+            # 4. Create workshop user
+            # ----------------------------------------------------------
+            useradd -m -s /bin/bash kirouser
+            echo "kirouser:${DCVPassword}" | chpasswd
+
+            # Add user to necessary groups
+            usermod -aG wheel kirouser
+
+            # ----------------------------------------------------------
+            # 5. Install Kiro IDE
+            # ----------------------------------------------------------
+            cd /opt
+            wget -q "https://prod.download.desktop.kiro.dev/releases/stable/linux-x64/signed/0.12.263/tar/kiro-ide-0.12.263-stable-linux-x64.tar.gz" -O kiro-ide.tar.gz
+            tar -xzf kiro-ide.tar.gz
+            rm -f kiro-ide.tar.gz
+
+            # Create symlink for easy access
+            ln -sf /opt/kiro-ide-*/bin/kiro /usr/local/bin/kiro
+
+            # Create desktop shortcut for kirouser
+            mkdir -p /home/kirouser/Desktop
+            cat > /home/kirouser/Desktop/kiro.desktop << 'DESKTOP'
+            [Desktop Entry]
+            Name=Kiro IDE
+            Comment=Agentic AI IDE
+            Exec=/usr/local/bin/kiro --no-sandbox
+            Icon=/opt/kiro-ide-*/resources/app/resources/linux/code.png
+            Terminal=false
+            Type=Application
+            Categories=Development;IDE;
+            StartupNotify=true
+            DESKTOP
+            chmod +x /home/kirouser/Desktop/kiro.desktop
+
+            # Trust the desktop file for GNOME
+            mkdir -p /home/kirouser/.local/share/applications
+            cp /home/kirouser/Desktop/kiro.desktop /home/kirouser/.local/share/applications/
+
+            chown -R kirouser:kirouser /home/kirouser/
+
+            # ----------------------------------------------------------
+            # 6. Install Kiro CLI
+            # ----------------------------------------------------------
+            su - kirouser -c 'curl -fsSL https://cli.kiro.dev/install | bash'
+
+            # ----------------------------------------------------------
+            # 7. Install additional dev tools
+            # ----------------------------------------------------------
+            # Git (usually pre-installed)
+            dnf install -y git
+
+            # Node.js via dnf
+            dnf install -y nodejs npm
+
+            # AWS CLI v2
+            cd /tmp
+            curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            dnf install -y unzip
+            unzip -q awscliv2.zip
+            ./aws/install
+            rm -rf aws awscliv2.zip
+
+            # ----------------------------------------------------------
+            # 8. Start services
+            # ----------------------------------------------------------
+            systemctl start gdm
+            systemctl start dcvserver
+
+            # Create DCV session
+            sleep 5
+            dcv create-session --owner kirouser --type=console kiro-session
+
+            echo "=== Kiro Workshop Instance Setup Complete ==="
+
+            # Signal CloudFormation
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource WorkshopInstances || true
+
+  # ============================================================
+  # EC2 INSTANCES (using Count)
+  # ============================================================
+  # Since CloudFormation doesn't natively support dynamic instance counts
+  # with a Launch Template in a simple way, we use an AutoScaling Group
+  # with desired capacity = NumberOfInstances.
+  # ============================================================
+  WorkshopInstances:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref KiroLaunchTemplate
+        Version: !GetAtt KiroLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref NumberOfInstances
+      MaxSize: !Ref NumberOfInstances
+      DesiredCapacity: !Ref NumberOfInstances
+      AvailabilityZones:
+        - !Select [0, !GetAZs '']
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-kiro-instance"
+          PropagateAtLaunch: true
+        - Key: Workshop
+          Value: KiroIDE
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref NumberOfInstances
+        Timeout: PT30M
+
+Outputs:
+  VPCId:
+    Description: VPC ID created for the workshop
+    Value: !Ref VPC
+
+  SecurityGroupId:
+    Description: Security Group ID for workshop instances
+    Value: !Ref WorkshopSecurityGroup
+
+  DCVAccessInstructions:
+    Description: How to access Kiro IDE on each instance
+    Value: !Sub >
+      1. Go to the EC2 console and find instances tagged "${AWS::StackName}-kiro-instance".
+      2. Copy the Public IP of the instance assigned to you.
+      3. Open your browser and navigate to: https://<PUBLIC_IP>:8443
+      4. Accept the self-signed certificate warning.
+      5. Log in with username "kirouser" and the password you set during deployment.
+      6. Double-click the Kiro IDE icon on the desktop to launch it.
+
+  WorkshopUsername:
+    Description: Username to log into the remote desktop
+    Value: kirouser
+
+  NumberOfInstances:
+    Description: Total instances deployed
+    Value: !Ref NumberOfInstances
