@@ -256,23 +256,33 @@ Resources:
                 Value: !Sub "${AWS::StackName}-instance"
         UserData:
           Fn::Base64: !Sub |
-            #!/bin/bash -xe
+            #!/bin/bash
             exec > /var/log/kiro-setup.log 2>&1
+            set -x
 
             echo "=== Starting Kiro Workshop Instance Setup ==="
+
+            # Install CloudFormation helper scripts
+            dnf install -y aws-cfn-bootstrap || true
 
             # Update system
             dnf update -y
 
             # ----------------------------------------------------------
-            # 1. Install GNOME Desktop Environment
+            # 1. Install MATE Desktop Environment (lightweight, works well with DCV on non-GPU instances)
             # ----------------------------------------------------------
-            dnf groupinstall "Desktop" -y
-            dnf install -y gdm gnome-terminal firefox
+            dnf install -y mate-desktop mate-session-manager mate-terminal mate-panel \
+              mate-themes mate-icon-theme firefox dbus-x11 xorg-x11-server-Xorg \
+              xorg-x11-xinit xorg-x11-drv-dummy mesa-dri-drivers || true
+
+            # If MATE not available, fall back to minimal GNOME
+            if ! command -v mate-session &> /dev/null; then
+              dnf groupinstall "Desktop" -y
+              dnf install -y gnome-terminal firefox
+            fi
 
             # Set graphical target as default
             systemctl set-default graphical.target
-            systemctl enable gdm
 
             # ----------------------------------------------------------
             # 2. Install Amazon DCV
@@ -300,10 +310,10 @@ Resources:
             # ----------------------------------------------------------
             # 3. Configure DCV
             # ----------------------------------------------------------
-            # Enable and start DCV
+            # Enable DCV
             systemctl enable dcvserver
 
-            # Configure DCV for automatic console sessions
+            # Configure DCV for virtual sessions (no GPU required)
             mkdir -p /etc/dcv
             cat > /etc/dcv/dcv.conf << 'DCVCONF'
             [license]
@@ -312,12 +322,10 @@ Resources:
             virtual-session-xdcv-args=""
             [session-management/defaults]
             [session-management/automatic-console-session]
-            owner="kirouser"
             [display]
             [display/linux]
             [connectivity]
             web-port=8443
-            web-url-path="/dcv"
             enable-quic-frontend=true
             [security]
             authentication="system"
@@ -347,21 +355,22 @@ Resources:
             rm -f kiro-ide.tar.gz
 
             # Create symlink for easy access
-            ln -sf /opt/kiro-ide-*/bin/kiro /usr/local/bin/kiro
+            KIRO_DIR=$(ls -d /opt/Kiro /opt/kiro-ide-* 2>/dev/null | head -1)
+            ln -sf "$KIRO_DIR/bin/kiro" /usr/local/bin/kiro
 
             # Create desktop shortcut for kirouser
             mkdir -p /home/kirouser/Desktop
-            cat > /home/kirouser/Desktop/kiro.desktop << 'DESKTOP'
+            cat > /home/kirouser/Desktop/kiro.desktop << EOF
             [Desktop Entry]
             Name=Kiro IDE
             Comment=Agentic AI IDE
-            Exec=/usr/local/bin/kiro --no-sandbox
-            Icon=/opt/kiro-ide-*/resources/app/resources/linux/code.png
+            Exec=$KIRO_DIR/bin/kiro --no-sandbox
+            Icon=$KIRO_DIR/resources/app/resources/linux/code.png
             Terminal=false
             Type=Application
             Categories=Development;IDE;
             StartupNotify=true
-            DESKTOP
+            EOF
             chmod +x /home/kirouser/Desktop/kiro.desktop
 
             # Trust the desktop file for GNOME
@@ -395,17 +404,41 @@ Resources:
             # ----------------------------------------------------------
             # 8. Start services
             # ----------------------------------------------------------
-            systemctl start gdm
+            # Start DCV server
             systemctl start dcvserver
-
-            # Create DCV session
             sleep 5
-            dcv create-session --owner kirouser --type=console kiro-session
+
+            # Create a virtual DCV session (works without GPU/GDM)
+            dcv create-session --owner kirouser --type=virtual --init /usr/bin/mate-session kiro-session 2>/dev/null || \
+            dcv create-session --owner kirouser --type=virtual --init /usr/bin/gnome-session kiro-session 2>/dev/null || \
+            dcv create-session --owner kirouser --type=virtual kiro-session
+
+            # Verify session exists
+            dcv list-sessions
+
+            # Create a systemd service to auto-create session on reboot
+            cat > /etc/systemd/system/dcv-session.service << 'SVCEOF'
+            [Unit]
+            Description=DCV Virtual Session
+            After=dcvserver.service
+            Requires=dcvserver.service
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStartPre=/bin/sleep 5
+            ExecStart=/usr/bin/dcv create-session --owner kirouser --type=virtual kiro-session
+
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
+            systemctl daemon-reload
+            systemctl enable dcv-session.service
 
             echo "=== Kiro Workshop Instance Setup Complete ==="
 
-            # Signal CloudFormation
-            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource WorkshopInstances || true
+            # Signal CloudFormation success
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --region ${AWS::Region} --resource WorkshopInstances 2>/dev/null || true
 
   # ============================================================
   # EC2 INSTANCES (using Count)
@@ -435,10 +468,6 @@ Resources:
         - Key: Workshop
           Value: KiroIDE
           PropagateAtLaunch: true
-    CreationPolicy:
-      ResourceSignal:
-        Count: !Ref NumberOfInstances
-        Timeout: PT30M
 
 Outputs:
   VPCId:

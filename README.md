@@ -6,20 +6,20 @@ Deploy multiple EC2 instances pre-loaded with **Kiro IDE** and accessible via a 
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  AWS Cloud                                                │
-│                                                           │
+│  AWS Cloud                                               │
+│                                                          │
 │  ┌─────────────────────────────────────────────────────┐ │
 │  │  VPC (10.0.0.0/16)                                  │ │
 │  │                                                     │ │
 │  │  ┌───────────────────────────────────────────────┐  │ │
 │  │  │  Public Subnet (10.0.1.0/24)                  │  │ │
 │  │  │                                               │  │ │
-│  │  │   ┌──────────┐  ┌──────────┐  ┌──────────┐   │  │ │
-│  │  │   │ Instance │  │ Instance │  │ Instance │   │  │ │
-│  │  │   │    #1    │  │    #2    │  │   #N     │   │  │ │
-│  │  │   │  Kiro +  │  │  Kiro +  │  │  Kiro +  │   │  │ │
-│  │  │   │   DCV    │  │   DCV    │  │   DCV    │   │  │ │
-│  │  │   └────┬─────┘  └────┬─────┘  └────┬─────┘   │  │ │
+│  │  │   ┌──────────┐  ┌──────────┐  ┌──────────┐    │  │ │
+│  │  │   │ Instance │  │ Instance │  │ Instance │    │  │ │
+│  │  │   │    #1    │  │    #2    │  │   #N     │    │  │ │
+│  │  │   │  Kiro +  │  │  Kiro +  │  │  Kiro +  │    │  │ │
+│  │  │   │   DCV    │  │   DCV    │  │   DCV    │    │  │ │
+│  │  │   └────┬─────┘  └────┬─────┘  └────┬─────┘     │  │ │
 │  │  │        │              │              │         │  │ │
 │  │  └────────┼──────────────┼──────────────┼─────────┘  │ │
 │  │           │              │              │            │ │
@@ -84,14 +84,29 @@ aws cloudformation create-stack \
 
 ## Accessing the Instances
 
+### Option 1: Amazon DCV Web Client (recommended)
+
+Use the Amazon DCV web client at [https://www.amazondcv.com](https://www.amazondcv.com) — no installation required.
+
 1. In the EC2 console, find instances tagged with your stack name
-2. Note the **Public IP** of each instance
-3. Open a browser and navigate to: `https://<PUBLIC_IP>:8443`
-4. Accept the self-signed certificate warning
+2. Note the **Public IP** of the instance assigned to you
+3. Go to [https://www.amazondcv.com](https://www.amazondcv.com) in your browser
+4. Enter the connection details:
+   - **Host**: `<PUBLIC_IP>`
+   - **Port**: `8443`
 5. Log in with:
    - **Username**: `kirouser`
-   - **Password**: the `DCVPassword` you set during deployment
+   - **Password**: the `DCVPassword` set during deployment
 6. Double-click the **Kiro IDE** desktop shortcut to launch it
+
+### Option 2: Direct browser connection
+
+1. Open your browser and navigate to: `https://<PUBLIC_IP>:8443`
+2. Accept the self-signed certificate warning
+3. Log in with:
+   - **Username**: `kirouser`
+   - **Password**: the `DCVPassword` set during deployment
+4. Double-click the **Kiro IDE** desktop shortcut to launch it
 
 ## Workshop Facilitator Tips
 
